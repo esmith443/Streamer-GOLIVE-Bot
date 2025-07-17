@@ -232,7 +232,7 @@ class StreamMonitorBot {
             case 'tiktok':
                 return { valid: true, message: 'TikTok user added (limited functionality)' };
             case 'kick':
-                return { valid: true, message: 'Kick user added' };
+                return await this.validateKickUser(username);
             default:
                 return { valid: false, message: 'Unsupported platform' };
         }
@@ -310,6 +310,89 @@ class StreamMonitorBot {
             return { 
                 valid: false, 
                 message: `Error validating Twitch user: ${error.message}` 
+            };
+        }
+    }
+
+    async validateKickUser(username) {
+        const { exec } = require('child_process');
+        const { promisify } = require('util');
+        const execAsync = promisify(exec);
+
+        try {
+            console.log(`Validating Kick user with curl: ${username}`);
+            
+            // Use curl to bypass Node.js TLS fingerprinting for validation
+            const curlCommand = `curl -s -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept: application/json" --max-time 10 "https://kick.com/api/v2/channels/${username}"`;
+            
+            const { stdout, stderr } = await execAsync(curlCommand);
+            
+            if (stderr && stderr.trim()) {
+                console.error(`Validation curl stderr for ${username}:`, stderr.trim());
+            }
+            
+            if (!stdout || stdout.trim() === '') {
+                return { 
+                    valid: false, 
+                    message: `No response from Kick API for "${username}"` 
+                };
+            }
+
+            // Parse the JSON response
+            let channelData;
+            try {
+                channelData = JSON.parse(stdout);
+            } catch (parseError) {
+                // If we can't parse JSON, try v1 API
+                try {
+                    const curlCommandV1 = `curl -s -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept: application/json" --max-time 10 "https://kick.com/api/v1/channels/${username}"`;
+                    const { stdout: stdoutV1 } = await execAsync(curlCommandV1);
+                    
+                    if (stdoutV1 && stdoutV1.trim()) {
+                        channelData = JSON.parse(stdoutV1);
+                    } else {
+                        throw new Error('No valid response from either API version');
+                    }
+                } catch (v1Error) {
+                    return { 
+                        valid: false, 
+                        message: `Failed to parse Kick API response for "${username}": ${parseError.message}` 
+                    };
+                }
+            }
+
+            // Check if we got an error response (like 404)
+            if (channelData.error) {
+                if (channelData.error.includes('not found') || channelData.error.includes('404')) {
+                    return { 
+                        valid: false, 
+                        message: `Kick channel "${username}" not found` 
+                    };
+                } else {
+                    return { 
+                        valid: false, 
+                        message: `Kick API error for "${username}": ${channelData.error}` 
+                    };
+                }
+            }
+
+            // Check if we got valid channel data
+            if (channelData.id && channelData.slug) {
+                return { 
+                    valid: true, 
+                    message: `Kick channel "${username}" found (ID: ${channelData.id})` 
+                };
+            } else {
+                return { 
+                    valid: false, 
+                    message: `Invalid channel data received for "${username}"` 
+                };
+            }
+
+        } catch (error) {
+            return { 
+                valid: false, 
+                message: `Error validating Kick channel "${username}": ${error.message}` 
             };
         }
     }
@@ -615,133 +698,88 @@ class StreamMonitorBot {
         }
         this.lastKickRequest = Date.now();
 
-        try {
-            // First try the API endpoint with enhanced headers
-            const response = await this.tryKickAPI(username);
-            if (response) {
-                return response;
+        // Use curl subprocess to bypass Node.js TLS fingerprinting detection
+        return await this.checkKickWithCurl(username);
+    }
+
+    async checkKickWithCurl(username) {
+        const { exec } = require('child_process');
+        const { promisify } = require('util');
+        const execAsync = promisify(exec);
+
+        // Multiple curl strategies to avoid security blocks
+        const strategies = [
+            {
+                name: 'v2 API with full headers',
+                command: `curl -s -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept: application/json" --max-time 15 "https://kick.com/api/v2/channels/${username}"`
+            },
+            {
+                name: 'v1 API with full headers',
+                command: `curl -s -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept: application/json" --max-time 15 "https://kick.com/api/v1/channels/${username}"`
+            },
+            {
+                name: 'v2 API with different UA',
+                command: `curl -s -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" -H "Accept: application/json" --max-time 15 "https://kick.com/api/v2/channels/${username}"`
+            },
+            {
+                name: 'v2 API mobile headers',
+                command: `curl -s -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15" -H "Accept: application/json" --max-time 15 "https://kick.com/api/v2/channels/${username}"`
             }
-            
-            // If API fails, try web scraping as fallback
-            console.log(`Kick API failed for ${username}, trying web scraping...`);
-            return await this.tryKickWebScraping(username);
-            
-        } catch (error) {
-            console.error(`All Kick methods failed for ${username}:`, error.message);
-            return false;
-        }
-    }
+        ];
 
-    async tryKickAPI(username) {
-        try {
-            // Generate random-looking headers
-            const userAgents = [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
-            ];
-            
-            const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
-            
-            const response = await axios.get(`https://kick.com/api/v1/channels/${username}`, {
-                headers: {
-                    'User-Agent': randomUA,
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Connection': 'keep-alive',
-                    'Sec-Fetch-Dest': 'empty',
-                    'Sec-Fetch-Mode': 'cors',
-                    'Sec-Fetch-Site': 'same-origin',
-                    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                    'Sec-Ch-Ua-Mobile': '?0',
-                    'Sec-Ch-Ua-Platform': '"Windows"',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache',
-                    'Referer': `https://kick.com/${username}`,
-                    'Origin': 'https://kick.com'
-                },
-                timeout: 15000
-            });
-            
-            return response.data.livestream !== null;
-        } catch (error) {
-            if (error.response?.status === 403) {
-                console.log(`Kick API returned 403 for ${username}, trying alternative approach...`);
-                return null; // Signal to try fallback method
+        for (let i = 0; i < strategies.length; i++) {
+            const strategy = strategies[i];
+            try {
+                console.log(`Kick: Trying ${strategy.name} for ${username}...`);
+                
+                const { stdout, stderr } = await execAsync(strategy.command);
+                
+                if (stderr && stderr.trim()) {
+                    console.log(`Curl stderr (${strategy.name}):`, stderr.trim());
+                }
+                
+                if (!stdout || stdout.trim() === '') {
+                    console.log(`Empty response from ${strategy.name} for ${username}`);
+                    continue; // Try next strategy
+                }
+
+                // Parse the JSON response
+                let channelData;
+                try {
+                    channelData = JSON.parse(stdout);
+                } catch (parseError) {
+                    console.log(`Failed to parse response from ${strategy.name}:`, parseError.message);
+                    continue; // Try next strategy
+                }
+
+                // Check if we got an error response
+                if (channelData.error) {
+                    console.log(`${strategy.name} blocked for ${username}:`, channelData.error);
+                    continue; // Try next strategy
+                }
+
+                // Success! Check if the channel has an active livestream
+                const isLive = channelData.livestream !== null && channelData.livestream !== undefined;
+                
+                console.log(`✅ Kick success (${strategy.name}) for ${username}:`, {
+                    id: channelData.id,
+                    slug: channelData.slug,
+                    livestream: isLive ? 'Active' : 'None'
+                });
+
+                return isLive;
+
+            } catch (error) {
+                console.log(`${strategy.name} execution error for ${username}:`, error.message);
+                continue; // Try next strategy
             }
-            throw error;
         }
+
+        // If all strategies failed, log comprehensive error
+        console.error(`❌ All Kick strategies failed for ${username} - platform may be temporarily blocking requests`);
+        return false;
     }
 
-    async tryKickWebScraping(username) {
-        try {
-            const userAgents = [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            ];
-            
-            const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
-            
-            const response = await axios.get(`https://kick.com/${username}`, {
-                headers: {
-                    'User-Agent': randomUA,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                    'Sec-Ch-Ua-Mobile': '?0',
-                    'Sec-Ch-Ua-Platform': '"Windows"',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache'
-                },
-                timeout: 15000,
-                maxRedirects: 5
-            });
-
-            const $ = cheerio.load(response.data);
-            
-            // Look for live indicators in the HTML
-            const liveIndicators = [
-                // Check for live status in page title
-                $('title').text().toLowerCase().includes('live'),
-                
-                // Check for meta tags indicating live status
-                $('meta[property="og:title"]').attr('content')?.toLowerCase().includes('live'),
-                $('meta[name="description"]').attr('content')?.toLowerCase().includes('live'),
-                
-                // Look for live elements in the page
-                $('.live-indicator').length > 0,
-                $('[data-testid="live-indicator"]').length > 0,
-                $('.livestream-container').length > 0,
-                
-                // Check for live text content
-                $('body').text().toLowerCase().includes('is live'),
-                $('body').text().toLowerCase().includes('live now'),
-                
-                // Look for video player elements that might indicate live stream
-                $('video').length > 0 && $('body').text().toLowerCase().includes('live'),
-                
-                // Check for JSON data that might contain live status
-                $('script').text().includes('"livestream"') && $('script').text().includes('true')
-            ];
-            
-            const isLive = liveIndicators.some(indicator => indicator);
-            console.log(`Kick web scraping for ${username}: ${isLive ? 'LIVE' : 'NOT LIVE'}`);
-            
-            return isLive;
-            
-        } catch (error) {
-            console.error(`Kick web scraping failed for ${username}:`, error.response?.status || error.message);
-            return false;
-        }
-    }
 
     async sendLiveNotification(user) {
         const liveUrl = this.generateLiveUrl(user.platform, user.username);
